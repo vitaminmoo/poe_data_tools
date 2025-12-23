@@ -1,4 +1,8 @@
-use std::path::Path;
+use std::{
+    fs,
+    hash::{BuildHasher, Hasher},
+    path::Path,
+};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -11,7 +15,10 @@ use nom::{
 };
 use url::Url;
 
-use crate::bundle::{fetch_bundle_content, load_bundle_content, parse_bundle};
+use crate::{
+    bundle::{fetch_bundle_content, load_bundle_content, parse_bundle},
+    hasher::BuildMurmurHash64A,
+};
 
 #[derive(Debug)]
 pub struct BundleInfo {
@@ -136,20 +143,90 @@ pub fn parse_bundle_index(input: &[u8]) -> IResult<&[u8], BundleIndex> {
 }
 
 /// Load an index file from disk
-pub fn load_index_file(path: &Path) -> Result<BundleIndex> {
-    let index_content = load_bundle_content(path)
-        .context("Failed to read bundle index")?
-        .read_all();
-    let (_, index) = parse_bundle_index(&index_content)
-        .map_err(|_| anyhow!("Failed to parse bundle as index"))?;
-    Ok(index)
+pub fn load_index_file(path: &Path, cache_dir: Option<&Path>) -> Result<BundleIndex> {
+    if let Some(cache_dir) = cache_dir {
+        // Create a stable hash of the source path to use as the cache filename
+        let mut hasher = BuildMurmurHash64A { seed: 0x1337b33f }.build_hasher();
+        hasher.write(path.to_string_lossy().as_bytes());
+        let hash = hasher.finish();
+
+        let cache_path = cache_dir
+            .join("decompressed_index")
+            .join(format!("steam_{:x}.bin", hash));
+
+        // Check if cache is valid (exists and is newer than source)
+        let mut valid_cache = false;
+        if cache_path.exists() {
+            let source_metadata =
+                fs::metadata(path).context("Failed to get source file metadata")?;
+            let cache_metadata =
+                fs::metadata(&cache_path).context("Failed to get cache file metadata")?;
+
+            if cache_metadata.modified()? >= source_metadata.modified()? {
+                valid_cache = true;
+            }
+        }
+
+        if valid_cache {
+            // eprintln!("Loading decompressed index from cache: {:?}", cache_path);
+            let index_content = fs::read(&cache_path)?;
+            let (_, index) = parse_bundle_index(&index_content)
+                .map_err(|_| anyhow!("Failed to parse cached bundle index"))?;
+            return Ok(index);
+        }
+
+        // Cache miss or stale
+        let index_content = load_bundle_content(path)
+            .context("Failed to read bundle index")?
+            .read_all();
+
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&cache_path, &index_content)?;
+
+        let (_, index) = parse_bundle_index(&index_content)
+            .map_err(|_| anyhow!("Failed to parse bundle as index"))?;
+        Ok(index)
+    } else {
+        let index_content = load_bundle_content(path)
+            .context("Failed to read bundle index")?
+            .read_all();
+        let (_, index) = parse_bundle_index(&index_content)
+            .map_err(|_| anyhow!("Failed to parse bundle as index"))?;
+        Ok(index)
+    }
 }
 
 /// Fetch an index file from the CDN (or cache)
 pub fn fetch_index_file(base_url: &Url, cache_dir: &Path, path: &Path) -> Result<BundleIndex> {
+    let url = base_url.join(path.to_str().context("Failed to convert path to string")?)?;
+
+    // Construct cache path for decompressed index
+    let url_str = url.to_string();
+    let relative_path = url_str
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+
+    let decompressed_cache_path = cache_dir.join("decompressed_index").join(relative_path);
+
+    if decompressed_cache_path.exists() {
+        let index_content = fs::read(&decompressed_cache_path)?;
+        let (_, index) = parse_bundle_index(&index_content)
+            .map_err(|_| anyhow!("Failed to parse cached bundle index"))?;
+        return Ok(index);
+    }
+
     let index_content = fetch_bundle_content(base_url, cache_dir, path)
         .context("Failed to fetch bundle index")?
         .read_all();
+
+    // Cache the decompressed content
+    if let Some(parent) = decompressed_cache_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&decompressed_cache_path, &index_content)?;
+
     let (_, index) = parse_bundle_index(&index_content)
         .map_err(|_| anyhow!("Failed to parse bundle as index"))?;
     Ok(index)

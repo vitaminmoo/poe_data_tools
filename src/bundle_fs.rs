@@ -40,7 +40,8 @@ impl FS {
     /// Initialise a file system over a steam folder
     pub fn from_steam(steam_folder: PathBuf, cache_dir: Option<PathBuf>) -> Result<FS> {
         let index_path = steam_folder.as_path().join("Bundles2/_.index.bin");
-        let index = load_index_file(&index_path).context("Failed to load bundle index")?;
+        let index = load_index_file(&index_path, cache_dir.as_deref())
+            .context("Failed to load bundle index")?;
 
         // Hash the steam folder path to create a stable ID for this installation
         let mut hasher = BuildMurmurHash64A { seed: 0x1337b33f }.build_hasher();
