@@ -23,6 +23,7 @@ impl Hasher for MurmurHash64A {
     }
 }
 
+#[derive(Copy, Clone)]
 pub struct BuildMurmurHash64A {
     pub seed: u64,
 }

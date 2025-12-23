@@ -33,8 +33,11 @@ fn fs_load_index(c: &mut Criterion) {
 }
 
 fn steam_fs() -> FS {
-    FS::from_steam(steam_folder_search("2").expect("Can't find steam folder"))
-        .expect("Failed to load file system")
+    FS::from_steam(
+        steam_folder_search("2").expect("Can't find steam folder"),
+        None,
+    )
+    .expect("Failed to load file system")
 }
 
 fn cdn_fs() -> FS {
