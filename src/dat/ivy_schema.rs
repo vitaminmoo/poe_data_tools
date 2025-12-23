@@ -3,6 +3,8 @@ use std::{fs, path::Path};
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::VERBOSE;
+
 #[derive(Deserialize, Debug)]
 pub struct SchemaCollection {
     pub tables: Vec<DatTableSchema>,
@@ -53,14 +55,18 @@ pub fn fetch_schema(cache_dir: &Path) -> Result<SchemaCollection> {
     // File fresh? Use it
     if let Ok(metadata) = fs::metadata(&schema_path) {
         if metadata.modified()?.elapsed()?.as_secs() < 3600 {
-            eprintln!("Using cached schema");
+            if *VERBOSE.get().unwrap_or(&false) {
+                eprintln!("Using cached schema");
+            }
             return Ok(serde_json::from_str(
                 fs::read_to_string(schema_path)?.as_str(),
             )?);
         }
     }
 
-    eprintln!("Fetching schema from github");
+    if *VERBOSE.get().unwrap_or(&false) {
+        eprintln!("Fetching schema from github: {}", SCHEMA_URL);
+    }
     let client = reqwest::blocking::Client::new();
     let mut req = client.get(SCHEMA_URL);
 

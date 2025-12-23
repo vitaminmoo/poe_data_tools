@@ -12,6 +12,8 @@ use nom::{bytes::complete::take, multi::count, number::complete::le_u8, IResult}
 use reqwest::blocking::Client;
 use url::Url;
 
+use crate::VERBOSE;
+
 pub struct CDNLoader {
     base_url: Url,
     cache_dir: String,
@@ -38,18 +40,27 @@ impl CDNLoader {
         let cache_path =
             PathBuf::from(&self.cache_dir).join(url.to_string().trim_start_matches("https://"));
         if let Ok(bytes) = fs::read(&cache_path) {
-            //eprintln!("Loading bundle from cache: {:?}", path_stub);
+            if *VERBOSE.get().unwrap_or(&false) {
+                eprintln!("Loading bundle from cache: {:?}", path_stub);
+            }
             return Ok(Bytes::from(bytes));
         }
 
-        eprintln!("Downloading bundle: {}", url);
+        if *VERBOSE.get().unwrap_or(&false) {
+            eprintln!("Downloading bundle: {}", url);
+        }
+
         // Short timeout for initial connection, but none for transfer to allow for fetching large
         // files on a poor network connection
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(None)
             .build()?;
-        let bytes = client.get(url).send()?.error_for_status()?.bytes()?;
+        let bytes = client
+            .get(url.clone())
+            .send()?
+            .error_for_status()?
+            .bytes()?;
         // Save data to file - data first then ETag in case of failure mid-download
         fs::create_dir_all(cache_path.parent().context("Failed to get path parent")?)?;
         fs::write(&cache_path, &bytes)?;
@@ -67,7 +78,9 @@ pub fn cdn_base_url(cache_dir: &Path, version: &str) -> anyhow::Result<Url> {
     if cache_file.exists() && fs::metadata(&cache_file)?.modified()?.elapsed()?.as_secs() < 3600 {
         let url = Url::parse(fs::read_to_string(&cache_file)?.as_str())
             .with_context(|| "Failed to parse URL")?;
-        eprintln!("Using cached CDN URL: {}", url);
+        if *VERBOSE.get().unwrap_or(&false) {
+            eprintln!("Using cached CDN URL: {}", url);
+        }
         return Ok(url);
     }
 
@@ -91,7 +104,10 @@ pub fn cdn_base_url(cache_dir: &Path, version: &str) -> anyhow::Result<Url> {
 
     fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
     fs::write(&cache_file, url.as_str()).context("Failed to write URL to cache")?;
-    eprintln!("Refreshed CDN URL: {}", url);
+
+    if *VERBOSE.get().unwrap_or(&false) {
+        eprintln!("Refreshed CDN URL: {}", url);
+    }
     Ok(url)
 }
 
@@ -116,6 +132,10 @@ fn parse_utf16_string(input: &[u8]) -> IResult<&[u8], String> {
 
 /// Fetch the current latest version of the game
 fn cur_url(host: String, send: &[u8]) -> anyhow::Result<Url> {
+    if *VERBOSE.get().unwrap_or(&false) {
+        eprintln!("Connecting to patch server: {}", host);
+    }
+
     // Fetch data from the CDN - todo: looks like this returns a list of URLs. Might need to use a
     // streaming-style parsing instead of just reading 1Kb down the line if there's a bunch of
     // strings

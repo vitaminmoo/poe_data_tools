@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fs, path::Path};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -9,17 +9,18 @@ use nom::{
     number::complete::{le_u32, le_u64},
     IResult,
 };
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::bundle::{fetch_bundle_content, load_bundle_content, parse_bundle};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BundleInfo {
     pub name: String,
     pub uncompressed_size: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FileInfo {
     pub hash: u64,
     pub bundle_index: u32,
@@ -27,7 +28,7 @@ pub struct FileInfo {
     pub size: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PathRep {
     pub hash: u64,
     pub offset: u32,
@@ -35,7 +36,7 @@ pub struct PathRep {
     pub recursive_size: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BundleIndex {
     pub bundles: Vec<BundleInfo>,
     pub files: Vec<FileInfo>,
@@ -147,10 +148,42 @@ pub fn load_index_file(path: &Path) -> Result<BundleIndex> {
 
 /// Fetch an index file from the CDN (or cache)
 pub fn fetch_index_file(base_url: &Url, cache_dir: &Path, path: &Path) -> Result<BundleIndex> {
+    // Calculate the expected cache path for the index file
+    let url = base_url.join(path.to_str().unwrap())?;
+    let path_stub = url.to_string().trim_start_matches("https://").to_string();
+    let cache_path = cache_dir.join(&path_stub);
+
+    // Check for a parsed version first
+    // We add .parsed to the end of the filename
+    let parsed_path = cache_path.with_extension("bin.parsed");
+
+    if parsed_path.exists() {
+        if let Ok(file) = fs::File::open(&parsed_path) {
+            let reader = std::io::BufReader::new(file);
+            if let Ok(index) = rmp_serde::decode::from_read(reader) {
+                return Ok(index);
+            }
+        }
+    }
+
+    // Fallback to normal fetch/parse
     let index_content = fetch_bundle_content(base_url, cache_dir, path)
         .context("Failed to fetch bundle index")?
         .read_all();
     let (_, index) = parse_bundle_index(&index_content)
         .map_err(|_| anyhow!("Failed to parse bundle as index"))?;
+
+    // Save the parsed version
+    // Ensure directory exists (fetch_bundle_content should have created it, but just in case)
+    if let Some(parent) = parsed_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if let Ok(file) = fs::File::create(&parsed_path) {
+        let mut writer = std::io::BufWriter::new(file);
+        // We ignore write errors as caching is an optimization
+        let _ = rmp_serde::encode::write(&mut writer, &index);
+    }
+
     Ok(index)
 }
