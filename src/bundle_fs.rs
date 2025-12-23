@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs,
     hash::{BuildHasher, Hasher},
     path::{Path, PathBuf},
 };
@@ -22,11 +23,12 @@ pub struct FS {
     steam_folder: Option<PathBuf>,
     base_url: Option<Url>,
     cache_dir: Option<PathBuf>,
+    cas_dir: Option<PathBuf>,
 }
 
 impl FS {
     /// Initialise a file system over a steam folder
-    pub fn from_steam(steam_folder: PathBuf) -> Result<FS> {
+    pub fn from_steam(steam_folder: PathBuf, cache_dir: &Path) -> Result<FS> {
         let index_path = steam_folder.as_path().join("Bundles2/_.index.bin");
         let index = load_index_file(&index_path).context("Failed to load bundle index")?;
 
@@ -37,12 +39,16 @@ impl FS {
             .map(|(i, f)| (f.hash, i))
             .collect();
 
+        let cas_dir = cache_dir.join("cas");
+        fs::create_dir_all(&cas_dir).context("Failed to create CAS directory")?;
+
         Ok(FS {
             index,
             lut,
             steam_folder: Some(steam_folder.clone()),
             base_url: None,
-            cache_dir: None,
+            cache_dir: Some(cache_dir.to_path_buf()),
+            cas_dir: Some(cas_dir),
         })
     }
 
@@ -62,12 +68,16 @@ impl FS {
             .map(|(i, f)| (f.hash, i))
             .collect();
 
+        let cas_dir = cache_dir.join("cas");
+        fs::create_dir_all(&cas_dir).context("Failed to create CAS directory")?;
+
         Ok(FS {
             index,
             lut,
             steam_folder: None,
             base_url: Some(base_url.clone()),
             cache_dir: Some(cache_dir.to_path_buf()),
+            cas_dir: Some(cas_dir),
         })
     }
 
@@ -77,6 +87,14 @@ impl FS {
             .paths
             .iter()
             .flat_map(|p| parse_paths(&self.index.path_rep_bundle, p).get_paths())
+    }
+
+    fn get_cas_path(&self, hash: u64) -> Option<(PathBuf, PathBuf)> {
+        let cas_dir = self.cas_dir.as_ref()?;
+        let hash_hex = format!("{:016x}", hash);
+        let dir = cas_dir.join(&hash_hex[0..2]).join(&hash_hex[2..4]);
+        let file = dir.join(&hash_hex);
+        Some((dir, file))
     }
 
     /// Read many files at once, optimising batch loads. Does not preserve order of paths given.
@@ -107,59 +125,89 @@ impl FS {
             })
             .bucket_result();
 
-        // Batch them into their bundles
-        let fileinfos =
-            fileinfos
-                .into_iter()
-                .fold(HashMap::<_, Vec<_>>::new(), |mut acc, (path, fileinfo)| {
-                    acc.entry(fileinfo.bundle_index)
-                        .or_default()
-                        .push((path, fileinfo));
-
-                    acc
-                });
-
-        // Process files bundle-wise
-        let file_contents = fileinfos.into_iter().flat_map(|(bundle_index, files)| {
-            // Load the bundle
-            let bundle_path = format!(
-                "Bundles2/{}.bundle.bin",
-                self.index.bundles[bundle_index as usize].name
-            );
-            let bundle = if let Some(steam_folder) = &self.steam_folder {
-                let bundle_path = steam_folder.join(bundle_path);
-                load_bundle_content(&bundle_path)
-                    .with_context(|| format!("Failed to load bundle file: {:?}", bundle_path))
-            } else {
-                let bundle_path = PathBuf::from(bundle_path);
-                fetch_bundle_content(
-                    self.base_url.as_ref().unwrap(),
-                    self.cache_dir.as_ref().unwrap(),
-                    &bundle_path,
-                )
-                .with_context(|| format!("Failed to fetch bundle file: {:?}", bundle_path))
-            };
-
-            // Read the file contents - todo: see if we can do this lazily instead of
-            // collecting all files within a bundle at once
-            let contents: Vec<_> = match bundle {
-                Ok(b) => files
-                    .into_iter()
-                    .map(|(path, file)| {
-                        Ok((path, b.read_range(file.offset as usize, file.size as usize)))
-                    })
-                    .collect(),
-                Err(e) => files
-                    .into_iter()
-                    .map(|(path, _)| Err((path, anyhow!("{:?}", e))))
-                    .collect(),
-            };
-
-            contents
+        // 1. Try to read from CAS
+        let (cached, not_cached) = fileinfos.into_iter().partition::<Vec<_>, _>(|(_, file)| {
+            if let Some((_, cas_path)) = self.get_cas_path(file.hash) {
+                if let Ok(metadata) = fs::metadata(&cas_path) {
+                    return metadata.len() == file.size as u64;
+                }
+            }
+            false
         });
 
+        let cached_results = cached.into_iter().map(|(path, file)| {
+            let (_, cas_path) = self.get_cas_path(file.hash).unwrap();
+            match fs::read(&cas_path) {
+                Ok(bytes) => Ok((path, Bytes::from(bytes))),
+                Err(e) => Err((path, anyhow!("Failed to read from CAS: {}", e))),
+            }
+        });
+
+        // 2. Batch the rest into their bundles
+        let fileinfos_by_bundle = not_cached.into_iter().fold(
+            HashMap::<_, Vec<_>>::new(),
+            |mut acc, (path, fileinfo)| {
+                acc.entry(fileinfo.bundle_index)
+                    .or_default()
+                    .push((path, fileinfo));
+
+                acc
+            },
+        );
+
+        // Process files bundle-wise
+        let fetched_contents = fileinfos_by_bundle
+            .into_iter()
+            .flat_map(|(bundle_index, files)| {
+                // Load the bundle
+                let bundle_path = format!(
+                    "Bundles2/{}.bundle.bin",
+                    self.index.bundles[bundle_index as usize].name
+                );
+                let bundle = if let Some(steam_folder) = &self.steam_folder {
+                    let bundle_path = steam_folder.join(bundle_path);
+                    load_bundle_content(&bundle_path)
+                        .with_context(|| format!("Failed to load bundle file: {:?}", bundle_path))
+                } else {
+                    let bundle_path = PathBuf::from(bundle_path);
+                    fetch_bundle_content(
+                        self.base_url.as_ref().unwrap(),
+                        self.cache_dir.as_ref().unwrap(),
+                        &bundle_path,
+                    )
+                    .with_context(|| format!("Failed to fetch bundle file: {:?}", bundle_path))
+                };
+
+                // Read the file contents - todo: see if we can do this lazily instead of
+                // collecting all files within a bundle at once
+                let contents: Vec<_> = match bundle {
+                    Ok(b) => files
+                        .into_iter()
+                        .map(|(path, file)| {
+                            let content = b.read_range(file.offset as usize, file.size as usize);
+                            // Save to CAS
+                            if let Some((cas_dir, cas_path)) = self.get_cas_path(file.hash) {
+                                let _ = fs::create_dir_all(cas_dir);
+                                let _ = fs::write(cas_path, &content);
+                            }
+                            Ok((path, content))
+                        })
+                        .collect(),
+                    Err(e) => files
+                        .into_iter()
+                        .map(|(path, _)| Err((path, anyhow!("{:?}", e))))
+                        .collect(),
+                };
+
+                contents
+            });
+
         // Add on previous errors
-        errors.into_iter().map(Err).chain(file_contents)
+        errors
+            .into_iter()
+            .map(Err)
+            .chain(cached_results)
+            .chain(fetched_contents)
     }
 
     pub fn read(&self, path: &str) -> Result<Bytes> {
@@ -175,6 +223,17 @@ impl FS {
             .get(&hash)
             .with_context(|| format!("Path not found in index: {}", path))?;
         let file = &self.index.files[*index];
+
+        // Check CAS
+        if let Some((_, cas_path)) = self.get_cas_path(file.hash) {
+            if let Ok(metadata) = fs::metadata(&cas_path) {
+                if metadata.len() == file.size as u64 {
+                    if let Ok(bytes) = fs::read(&cas_path) {
+                        return Ok(Bytes::from(bytes));
+                    }
+                }
+            }
+        }
 
         // Load the bundle
         let bundle = if let Some(steam_folder) = &self.steam_folder {
@@ -199,6 +258,13 @@ impl FS {
 
         // Pull out the file's contents
         let content = bundle.read_range(file.offset as usize, file.size as usize);
+
+        // Save to CAS
+        if let Some((cas_dir, cas_path)) = self.get_cas_path(file.hash) {
+            let _ = fs::create_dir_all(cas_dir);
+            let _ = fs::write(cas_path, &content);
+        }
+
         Ok(content)
     }
 }
